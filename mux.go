@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"path"
 	"regexp"
+	"net"
 )
 
 var (
-	ErrMethodMismatch = errors.New("method is not allowed")
-	ErrNotFound       = errors.New("no matching route was found")
+	ErrMethodMismatch   = errors.New("method is not allowed")
+	ErrNotFound         = errors.New("no matching route was found")
+	SettingCountWhileRL = false
 )
 
 // NewRouter returns a new router instance.
@@ -43,6 +45,9 @@ func NewRouter() *Router {
 type Router struct {
 	// Configurable Handler to be used when no route matches.
 	NotFoundHandler http.Handler
+
+	// RateLimit handler
+	RateLimitHandler http.Handler
 
 	// Configurable Handler to be used when the request method does not match the route.
 	MethodNotAllowedHandler http.Handler
@@ -109,12 +114,12 @@ func (r *Router) Match(req *http.Request, match *RouteMatch) bool {
 // mux.Vars(request).
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if !r.skipClean {
-		path := req.URL.Path
+		pth := req.URL.Path
 		if r.useEncodedPath {
-			path = req.URL.EscapedPath()
+			pth = req.URL.EscapedPath()
 		}
 		// Clean path to canonical form and redirect.
-		if p := cleanPath(path); p != path {
+		if p := cleanPath(pth); p != pth {
 
 			// Added 3 lines (Philip Schlump) - It was dropping the query string and #whatever from query.
 			// This matches with fix in go 1.2 r.c. 4 for same problem.  Go Issue:
@@ -130,6 +135,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	var match RouteMatch
 	var handler http.Handler
+
 	if r.Match(req, &match) {
 		handler = match.Handler
 		req = setVars(req, match.Vars)
@@ -142,11 +148,18 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	if handler == nil {
 		handler = http.NotFoundHandler()
+	} else if match.Route.rateLimits != nil && !match.Route.performRateLimit(net.ParseIP(req.RemoteAddr)) {
+		handler = r.RateLimitHandler
+
+		if handler == nil {
+			handler = rateLimitHandler()
+		}
 	}
 
 	if !r.KeepContext {
 		defer contextClear(req)
 	}
+
 	handler.ServeHTTP(w, req)
 }
 
@@ -386,7 +399,7 @@ type RouteMatch struct {
 type contextKey int
 
 const (
-	varsKey contextKey = iota
+	varsKey  contextKey = iota
 	routeKey
 )
 
@@ -562,10 +575,17 @@ func matchMapWithRegex(toCheck map[string]*regexp.Regexp, toMatch map[string][]s
 }
 
 // methodNotAllowed replies to the request with an HTTP status code 405.
-func methodNotAllowed(w http.ResponseWriter, r *http.Request) {
+func methodNotAllowed(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusMethodNotAllowed)
 }
 
 // methodNotAllowedHandler returns a simple request handler
 // that replies to each request with a status code 405.
 func methodNotAllowedHandler() http.Handler { return http.HandlerFunc(methodNotAllowed) }
+
+func rateLimitHandler() http.Handler {
+	return http.HandlerFunc(func (w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte("429 - Too many requests"))
+	})
+}

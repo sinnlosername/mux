@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
+	"net"
 )
 
 // Route stores information to match a request and build URLs.
@@ -39,6 +41,11 @@ type Route struct {
 	name string
 	// Error resulted from building a route.
 	err error
+
+	//Rate limit map
+	rateLimits map[time.Duration]int
+	//Map contains accesses (for ratelimit)
+	accesses map[time.Time]net.IP
 
 	buildVarsFunc BuildVarsFunc
 }
@@ -111,6 +118,71 @@ func (r *Route) BuildOnly() *Route {
 	r.buildOnly = true
 	return r
 }
+
+// RateLimit --------------------------------------------------------------------
+
+func (r *Route) RateLimits(m map[time.Duration]int) {
+	r.accesses = make(map[time.Time]net.IP)
+	r.rateLimits = m
+}
+
+func (r *Route) GetRateLimits() (map[time.Duration]int) {
+	return r.rateLimits
+}
+
+//noinspection GoBoolExpressions
+func (r *Route) performRateLimit(reqip net.IP) (bool) {
+	now := time.Now()
+	defCount := 1
+
+	if SettingCountWhileRL {
+		r.accesses[now] = reqip
+		defCount = 0
+	}
+
+	highest := -1
+
+	for _, v := range r.rateLimits {
+		if v > highest {
+			v = highest
+		}
+	}
+
+	for duration, limit := range r.rateLimits {
+
+		count := defCount
+
+		for stamp, ip := range r.accesses {
+
+			equalIp := ip.Equal(reqip)
+			after := stamp.Add(duration).After(now)
+
+			if after && equalIp {
+				count++
+				continue
+			} else if after {
+				continue
+			}
+
+			if limit == highest {
+				delete(r.accesses, stamp)
+			}
+
+		}
+
+		if count > limit {
+			return false
+		}
+
+	}
+
+	if !SettingCountWhileRL {
+		r.accesses[now] = reqip
+	}
+
+	return true
+}
+
 
 // Handler --------------------------------------------------------------------
 
