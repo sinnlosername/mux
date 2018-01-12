@@ -52,6 +52,9 @@ type Router struct {
 	// Configurable Handler to be used when the request method does not match the route.
 	MethodNotAllowedHandler http.Handler
 
+	// RateLimit block list
+	blockedIps []net.IP
+
 	// Parent route, if this is a subrouter.
 	parent parentRoute
 	// Routes to be matched, in order.
@@ -133,6 +136,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
+
 	var match RouteMatch
 	var handler http.Handler
 
@@ -142,18 +146,28 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		req = setCurrentRoute(req, match.Route)
 	}
 
+	host, _, _ := net.SplitHostPort(req.RemoteAddr)
+	remoteAddr := net.ParseIP(host)
+
+	isBlocked, unblock := ratelimitIsBlocked(match, r, remoteAddr, req)
+
+	if isBlocked {
+		handler = ratelimitHandle(r)
+	}
+
+	if unblock {
+		w.WriteHeader(200)
+		return
+	}
+
 	if handler == nil && match.MatchErr == ErrMethodMismatch {
 		handler = methodNotAllowedHandler()
 	}
 
 	if handler == nil {
 		handler = http.NotFoundHandler()
-	} else if match.Route.rateLimits != nil && !match.Route.performRateLimit(net.ParseIP(req.RemoteAddr)) {
-		handler = r.RateLimitHandler
-
-		if handler == nil {
-			handler = rateLimitHandler()
-		}
+	} else if !unblock && match.Route != nil && match.Route.rateLimits != nil && !match.Route.performRateLimit(net.ParseIP(req.RemoteAddr)) {
+		handler = ratelimitBlockIp(r, remoteAddr)
 	}
 
 	if !r.KeepContext {
@@ -338,6 +352,16 @@ func (r *Router) BuildVarsFunc(f BuildVarsFunc) *Route {
 // are explored depth-first.
 func (r *Router) Walk(walkFn WalkFunc) error {
 	return r.walk(walkFn, []*Route{})
+}
+
+// Check if an IP is blocked by the ratelimit
+func (r *Router) IsIpBlocked(ip net.IP) bool {
+	for _, bip := range r.blockedIps {
+		if bip.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // SkipRouter is used as a return value from WalkFuncs to indicate that the
@@ -583,9 +607,3 @@ func methodNotAllowed(w http.ResponseWriter, _ *http.Request) {
 // that replies to each request with a status code 405.
 func methodNotAllowedHandler() http.Handler { return http.HandlerFunc(methodNotAllowed) }
 
-func rateLimitHandler() http.Handler {
-	return http.HandlerFunc(func (w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
-		w.Write([]byte("429 - Too many requests"))
-	})
-}
